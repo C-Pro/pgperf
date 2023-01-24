@@ -15,7 +15,7 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-const batchSize = 100
+const batchSize = 1000
 
 var (
 	pool   *pgxpool.Pool
@@ -209,6 +209,11 @@ func doTrx(ctx context.Context, conn *pgxpool.Conn, from, to, amount int) {
 	tx.Commit(ctx)
 }
 
+const (
+	concurrency = 2
+	cardinality = 10000
+)
+
 func BenchmarkTransferLock(b *testing.B) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -233,8 +238,9 @@ func BenchmarkTransferLock(b *testing.B) {
 	if err := conn.QueryRow(ctx, q).Scan(&ids); err != nil {
 		b.Fatalf("failed to get IDRT accounts: %v", err)
 	}
+	ids = ids[:cardinality]
 
-	for i := 0; i < 8; i++ {
+	for i := 0; i < concurrency; i++ {
 		go func() {
 			conn, err := getConn(ctx)
 			if err != nil {

@@ -12,9 +12,47 @@ $ docker run --rm -v "$PWD:/docker-entrypoint-initdb.d" -p 5432:5432 -e POSTGRES
 $ go test -benchmem -bench Benchmark .
 ```
 
-Benchmarks demonstrate different methods of quering and inserting multiple records.
+Benchmarks demonstrate different methods of quering and inserting multiple records. Result will look like something like this:
+
+```
+BenchmarkGetUsers1-10                 13          88388846 ns/op          100454 B/op       2211 allocs/op
+BenchmarkGetUsers2-10                 30          39614951 ns/op           52517 B/op       1602 allocs/op
+BenchmarkGetUsers3-10                 34          35811223 ns/op           52489 B/op       1602 allocs/op
+BenchmarkGetUsers4-10               1681            713693 ns/op           14451 B/op        527 allocs/op
+BenchmarkInsertUsers1-10              36          33690527 ns/op           28324 B/op       1309 allocs/op
+BenchmarkInsertUsers2-10             700           1838951 ns/op          153586 B/op        416 allocs/op
+BenchmarkInsertUsers3-10             753           1667144 ns/op           15922 B/op        323 allocs/op
+BenchmarkInsertUsers4-10             796           1606043 ns/op           51486 B/op        845 allocs/op
+BenchmarkInsertUsers5-10             626           2096188 ns/op           55660 B/op       1029 allocs/op
+BenchmarkInsertUsers6-10             639           1992704 ns/op           23813 B/op        858 allocs/op
+BenchmarkTransferLock-10               3         411653458 ns/op         3003472 B/op     122049 allocs/op
+PASS
+ok      pgperf  22.485s
+```
+
+Lets break down the benchmarks one by one.
+`GetUsers*` functions accept a slice of user IDs as an input parameter and output a list of user names.
+
+* [`GetUsers1`](pgperf.go#L14) - the most "dumb" way to retreive multiple records: for each ID in a loop we create an sql statement with ID value interpolated in the string. This is the slowest method (2 orders of magnitude slower then the fastest one), it does many unnecessary allocations (and GC pressure), and it has a potential for SQL injection.
+* [`GetUsers2`](pgperf.go#L30) - in this implementation we use bind variables instead of directly embedding values in the sql string. This allows us to use single query string, which in case of `pgx` driver has the benifit of parsing the query only once (`pgx` driver [prepares the statement](https://www.postgresql.org/docs/current/sql-prepare.html) implicitly). So we have twice the speed and half of the allocations.
+* [`GetUsers3`](pgperf.go#L46) - here we explicitly prepare SQL statement and execute it in a loop. Performance is virtually the same as before (pgx does the same under the hood).
+* [`GetUsers4`](pgperf.go#L68) - this it the way to go. Instead of executing query in the loop we use a single query returing multiple rows instead. We use `= any($1)` operation to filter records by array of IDs. Here we use a feature of `pgx` driver that can directly convert slices of basic go types without need to use `Valuer` and `Scanner` adapters like [`pq.Array`](https://pkg.go.dev/github.com/lib/pq#Array). As you can see, the performance is more than two orders of magnitude of the baseline implementation.
 
 
+`InsertUsers*` - functions accept slice of user IDs as an input parameter, generate uniue user names like `"user 123"` and insert them to the `users` table.
+
+* [`InsertUsers1`](pgperf.go#L88) - our baseline implementation, that inserts records in the loop using bind variables (and prepared statments implicitly by `pgx` driver).
+* [`InsertUsers2`](pgperf.go#L99) - here we build one big SQL statement with multiple record insert using string concatenation (which allocates new string every time). Then execute this single statement. This is about 30x faster, but allocates 7x memory.
+* [`InsertUsers3`](pgperf.go#L111) - here we use [`strings.Builder`](https://pkg.go.dev/strings#Builder) which is a better way to build a large string in Go. The speed is the same as before, but we have 10x less bytes allocated.
+* [`InsertUsers4`](pgperf.go#L127) - the same as before, but now we use bind variables instead of embedding values in query string itself. It makes 2x allocations (because we now have query string AND params slice). Speed did not improve significantly, but we may want to consider long term impact of overloading Postgres parsed statements cache with many unique statements if we go "embedding values in the string" way. With bind variables we have single statement to parse (considering the batch size si a constant).
+* [`InsertUsers5`](pgperf.go#L148) - use [`pgx.Batch`](https://pkg.go.dev/github.com/jackc/pgx/v5#Batch) feature to batch multiple statements and execute them at once. Performance is slightly worse then previous implementation, but ease of use may be a factor here. And another thing to consider: `pgx.Batch` can batch *different* statements in one batch (like inserts to many tables mixed with updates and selects).
+* [`InsertUsers6`](pgperf.go#L162) - use [`COPY FROM STDIN`](https://www.postgresql.org/docs/current/sql-copy.html) PostgreSQL command to insert multiple records in one go. This one shines when you have *LOTS* of data to insert. This benchmark run used `const batchSize = 100`, not a best application for `COPY`. But for 10000 records or more `COPY FROM` would be the best implementation.
+
+Last benchmark for the [`TransferLock`](](pgperf.go#L177)) function that is an implementation of an atomic transfer of balance from one account to another one. It is used to demonstrate the effects of locking and concurrent queries on the query performance. To play with it try to change number of concurrently runnig goroutines and number of distinct accounts that do random transfers.
+
+E.g. performance with `concurrency = 8, cardinality = 100` is 100x worse than with `concurrency = 2, cardinality = 10000` because lock contention is much higher in the first configuration.
+
+## Optimizing the query
 
 To demonstrate how query planning works we connect to postgres using `psql` shell.
 
