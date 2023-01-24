@@ -1,4 +1,4 @@
-# Some tips on postgresql performance
+# Some tips on Go + PostgreSQL performance
 
 Database is often the main bottleneck in applications that need to serve large amounts of data per request, or experience high request rates.
 This repository is a code that I use as a set of examples/demos for my talk on optimizing query performance in PostgreSQL database applications.
